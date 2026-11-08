@@ -1,0 +1,94 @@
+# AppFactory AI - Research MVP
+#
+#   python scripts/generate_env.py        # writes .env with random secrets (first time only)
+#   docker compose up --build -d
+#
+# Exposure: only the API is reachable from the host, and only on 127.0.0.1 (put a TLS reverse proxy in
+# front for anything beyond your own machine). PostgreSQL and Redis publish NO ports and sit on an
+# internal network with no route to the internet.
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  image: appfactory-ai:0.2.0
+  env_file: .env
+  environment: &app-env
+    # Compose is the single place the data-store URLs are assembled, from the secrets in .env.
+    DATABASE_URL: postgresql+asyncpg://appfactory:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/appfactory
+    REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+services:
+  api:
+    <<: *app
+    container_name: appfactory-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    networks: [internal, egress]
+    # HEALTHCHECK is defined in the Dockerfile (GET /health).
+
+  worker:
+    <<: *app
+    container_name: appfactory-worker
+    command: ["arq", "app.worker.WorkerSettings"]
+    stop_grace_period: 60s
+    networks: [internal, egress]  # egress: Anthropic, Tavily, Apple
+    healthcheck:
+      test: ["CMD", "arq", "--check", "app.worker.WorkerSettings"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: appfactory-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: appfactory
+      POSTGRES_USER: appfactory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appfactory -d appfactory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    container_name: appfactory-redis
+    restart: unless-stopped
+    # AOF persistence (fsync every second) + password. Redis holds only job deliveries; PostgreSQL is
+    # the source of truth, so even total Redis loss cannot lose a run (the worker sweep re-delivers).
+    command: ["sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  internal:
+    internal: true  # no outbound internet; data stores live only here
+  egress:
+    driver: bridge
